@@ -54,7 +54,7 @@ DecryptStation3 is a modern Windows application designed to decrypt PlayStation 
 - [.NET 7.0 Runtime](https://dotnet.microsoft.com/download/dotnet/7.0)
 - [Windows App SDK Runtime](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads)
 ## 🚀 Getting Started
-1. Download the latest release from the [Releases](https://github.com/yourusername/DecryptStation3/releases) page
+1. Download the latest release from the [Releases](https://github.com/BazedFrog/DecryptStation3/releases) page
 2. Install the required runtimes if not already installed
 3. Launch DecryptStation3
 4. On first run, you'll need to provide the game keys database:
