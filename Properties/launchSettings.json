@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "DecryptStation3": {
+      "commandName": "Project",
+      "nativeDebugging": true
+    }
+  }
+}
