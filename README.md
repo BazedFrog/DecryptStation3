@@ -47,7 +47,7 @@ DecryptStation3 is a modern Windows application designed to decrypt PlayStation 
 - 🎯 **Smart Extraction**: Automatic content extraction after decryption
 - 🎨 **Modern UI**: Clean WinUI 3 interface with Mica backdrop
 - 🌙 **Theme Support**: Seamless light/dark theme integration
-- 💪 **Performance**: Multi-threaded processing for optimal speed making it way faster than ps3dec r5.
+- 💪 **Performance**: Multi-threaded processing for optimal speed making it way faster than PS3Dec r5.
 
 ## 📋 Requirements
 - Windows 10 version 1809 or higher
