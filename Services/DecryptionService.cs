@@ -11,7 +11,7 @@ namespace DecryptStation3.Services
     {
         private const int BufferSizeSec = 4096;
         private const int BufferSize = BufferSizeSec * 2048;
-        private static uint _globalLBA = 0;
+        private uint _globalLBA = 0;
         private readonly int _threadCount = Math.Max(1, Environment.ProcessorCount - 1);
 
         public event EventHandler<double>? ProgressChanged;
@@ -53,10 +53,13 @@ namespace DecryptStation3.Services
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
-                        var regionLastSector = CharArrBEToUInt(sec0sec1, 12 + ((int)i * 4));
-                        regionLastSector -= plain ? 0u : 1u;
+                        // Read region end sector from correct offset: 4 + (i*8) + 4 = 8 + (i*8)
+                        // Each region entry is 8 bytes (4 bytes start + 4 bytes end)
+                        // The end sector is EXCLUSIVE (not included in the region)
+                        var regionEndSector = CharArrBEToUInt(sec0sec1, 8 + ((int)i * 8));
 
-                        uint numSectors = regionLastSector - _globalLBA + 1;
+                        // Calculate sector count: end is exclusive, so no +1 needed
+                        uint numSectors = regionEndSector - _globalLBA;
                         uint numFullBlocks = numSectors / BufferSizeSec;
                         uint partialBlockSize = numSectors % BufferSizeSec;
                         uint numBlocks = numFullBlocks + (partialBlockSize == 0 ? 0u : 1u);
@@ -105,6 +108,8 @@ namespace DecryptStation3.Services
                         plain = !plain;
                         ProgressChanged?.Invoke(this, (double)(i + 1) / regions);
                     }
+
+                    outFile.Flush();
                 }, cancellationToken);
             }
             catch (Exception ex)
