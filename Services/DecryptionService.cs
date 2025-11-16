@@ -53,7 +53,9 @@ namespace DecryptStation3.Services
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
-                        var regionLastSector = CharArrBEToUInt(sec0sec1, 12 + ((int)i * 4));
+                        // Read region end sector from correct offset: 4 + (i*8) + 4 = 8 + (i*8)
+                        // Each region entry is 8 bytes (4 bytes start + 4 bytes end)
+                        var regionLastSector = CharArrBEToUInt(sec0sec1, 8 + ((int)i * 8));
                         regionLastSector -= plain ? 0u : 1u;
 
                         uint numSectors = regionLastSector - _globalLBA + 1;
