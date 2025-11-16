@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using DecryptStation3.Models;
+using System.Diagnostics;
 
 namespace DecryptStation3.Services
 {
@@ -38,16 +39,25 @@ namespace DecryptStation3.Services
                 await using var inFile = new FileStream(isoFile.FilePath, FileMode.Open, FileAccess.Read);
                 await using var outFile = new FileStream(isoFile.FilePath + ".dec", FileMode.Create);
 
+                var fileSize = inFile.Length;
+                var totalSectors = fileSize / 2048;
+                Debug.WriteLine($"[DECRYPT] File: {Path.GetFileName(isoFile.FilePath)}");
+                Debug.WriteLine($"[DECRYPT] File size: {fileSize:N0} bytes ({totalSectors} sectors)");
+
                 var sec0sec1 = new byte[4096];
                 ReadFully(inFile, sec0sec1, 0, 4096);
 
-                var regions = (CharArrBEToUInt(sec0sec1) * 2) - 1;
+                var numNormalRegions = CharArrBEToUInt(sec0sec1);
+                var regions = (numNormalRegions * 2) - 1;
+                Debug.WriteLine($"[DECRYPT] Normal regions: {numNormalRegions}, Total regions: {regions}");
+
                 var inBuffer = new byte[BufferSize];
 
                 await Task.Run(() =>
                 {
                     var first = true;
                     var plain = true;
+                    uint totalSectorsProcessed = 0;
 
                     for (uint i = 0; i < regions; i++)
                     {
@@ -64,6 +74,10 @@ namespace DecryptStation3.Services
                         uint partialBlockSize = numSectors % BufferSizeSec;
                         uint numBlocks = numFullBlocks + (partialBlockSize == 0 ? 0u : 1u);
 
+                        Debug.WriteLine($"[DECRYPT] Region {i}: {(plain ? "PLAIN" : "ENCRYPTED")}, " +
+                            $"Start={_globalLBA}, End={regionEndSector}, Sectors={numSectors}, " +
+                            $"Blocks={numBlocks} (full={numFullBlocks}, partial={partialBlockSize})");
+
                         if (plain)
                         {
                             for (uint currBlock = 0; currBlock < numBlocks; currBlock++)
@@ -75,8 +89,16 @@ namespace DecryptStation3.Services
                                 {
                                     if (currBlock == 0)
                                     {
-                                        Array.Copy(sec0sec1, 0, inBuffer, 0, 4096);
-                                        ReadFully(inFile, inBuffer, 4096, bytesToRead - 4096);
+                                        // Header (first 4096 bytes / 2 sectors) was already read
+                                        int headerSize = Math.Min(4096, bytesToRead);
+                                        Array.Copy(sec0sec1, 0, inBuffer, 0, headerSize);
+
+                                        int remainingBytes = bytesToRead - headerSize;
+                                        if (remainingBytes > 0)
+                                        {
+                                            ReadFully(inFile, inBuffer, headerSize, remainingBytes);
+                                        }
+                                        Debug.WriteLine($"[DECRYPT] First block: copied {headerSize} bytes from header, read {remainingBytes} bytes from file");
                                     }
                                     else
                                     {
@@ -105,8 +127,17 @@ namespace DecryptStation3.Services
                             }
                         }
 
+                        totalSectorsProcessed += numSectors;
+                        Debug.WriteLine($"[DECRYPT] Region {i} complete. Total sectors processed: {totalSectorsProcessed}, LBA now: {_globalLBA}");
+
                         plain = !plain;
                         ProgressChanged?.Invoke(this, (double)(i + 1) / regions);
+                    }
+
+                    Debug.WriteLine($"[DECRYPT] All regions processed. Total sectors: {totalSectorsProcessed}, Expected: {totalSectors}");
+                    if (totalSectorsProcessed != totalSectors)
+                    {
+                        Debug.WriteLine($"[DECRYPT] WARNING: Sector count mismatch! Processed {totalSectorsProcessed} but file has {totalSectors} sectors");
                     }
 
                     outFile.Flush();
@@ -114,6 +145,8 @@ namespace DecryptStation3.Services
             }
             catch (Exception ex)
             {
+                Debug.WriteLine($"[DECRYPT] ERROR: {ex.Message}");
+                Debug.WriteLine($"[DECRYPT] Stack trace: {ex.StackTrace}");
                 throw new Exception($"Decryption failed: {ex.Message}", ex);
             }
         }
@@ -158,11 +191,27 @@ namespace DecryptStation3.Services
 
         private static void ReadFully(Stream stream, byte[] buffer, int offset, int count)
         {
+            if (count == 0) return; // Nothing to read
+
+            if (count < 0)
+            {
+                throw new IOException($"Invalid read count: {count} bytes (offset={offset})");
+            }
+
             var totalRead = 0;
             while (totalRead < count)
             {
                 var read = stream.Read(buffer, offset + totalRead, count - totalRead);
-                if (read <= 0) throw new IOException("Failed to read from file");
+                if (read <= 0)
+                {
+                    var pos = stream.Position;
+                    var len = stream.Length;
+                    throw new IOException(
+                        $"Failed to read from file: requested {count} bytes at offset {offset}, " +
+                        $"but only read {totalRead}/{count} bytes. " +
+                        $"Stream position: {pos}, Stream length: {len}, " +
+                        $"Trying to read {count - totalRead} more bytes");
+                }
                 totalRead += read;
             }
         }
