@@ -55,10 +55,11 @@ namespace DecryptStation3.Services
 
                         // Read region end sector from correct offset: 4 + (i*8) + 4 = 8 + (i*8)
                         // Each region entry is 8 bytes (4 bytes start + 4 bytes end)
-                        var regionLastSector = CharArrBEToUInt(sec0sec1, 8 + ((int)i * 8));
-                        regionLastSector -= plain ? 0u : 1u;
+                        // The end sector is EXCLUSIVE (not included in the region)
+                        var regionEndSector = CharArrBEToUInt(sec0sec1, 8 + ((int)i * 8));
 
-                        uint numSectors = regionLastSector - _globalLBA + 1;
+                        // Calculate sector count: end is exclusive, so no +1 needed
+                        uint numSectors = regionEndSector - _globalLBA;
                         uint numFullBlocks = numSectors / BufferSizeSec;
                         uint partialBlockSize = numSectors % BufferSizeSec;
                         uint numBlocks = numFullBlocks + (partialBlockSize == 0 ? 0u : 1u);
