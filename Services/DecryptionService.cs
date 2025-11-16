@@ -63,19 +63,23 @@ namespace DecryptStation3.Services
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
-                        // Read region end sector from correct offset: 4 + (i*8) + 4 = 8 + (i*8)
+                        // Read region start and end sectors
                         // Each region entry is 8 bytes (4 bytes start + 4 bytes end)
-                        // The end sector is EXCLUSIVE (not included in the region)
+                        // Both are EXCLUSIVE boundaries (Rust uses sector >= start && sector < end)
+                        var regionStartSector = CharArrBEToUInt(sec0sec1, 4 + ((int)i * 8));
                         var regionEndSector = CharArrBEToUInt(sec0sec1, 8 + ((int)i * 8));
 
-                        // Calculate sector count: end is exclusive, so no +1 needed
-                        uint numSectors = regionEndSector - _globalLBA;
+                        // Calculate sector count: end - start (both exclusive)
+                        uint numSectors = regionEndSector - regionStartSector;
+
+                        // Update _globalLBA to this region's start
+                        _globalLBA = regionStartSector;
                         uint numFullBlocks = numSectors / BufferSizeSec;
                         uint partialBlockSize = numSectors % BufferSizeSec;
                         uint numBlocks = numFullBlocks + (partialBlockSize == 0 ? 0u : 1u);
 
                         Debug.WriteLine($"[DECRYPT] Region {i}: {(plain ? "PLAIN" : "ENCRYPTED")}, " +
-                            $"Start={_globalLBA}, End={regionEndSector}, Sectors={numSectors}, " +
+                            $"Start={regionStartSector}, End={regionEndSector}, Sectors={numSectors}, " +
                             $"Blocks={numBlocks} (full={numFullBlocks}, partial={partialBlockSize})");
 
                         if (plain)
