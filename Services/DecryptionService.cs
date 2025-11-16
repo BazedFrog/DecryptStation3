@@ -11,7 +11,7 @@ namespace DecryptStation3.Services
     {
         private const int BufferSizeSec = 4096;
         private const int BufferSize = BufferSizeSec * 2048;
-        private static uint _globalLBA = 0;
+        private uint _globalLBA = 0;
         private readonly int _threadCount = Math.Max(1, Environment.ProcessorCount - 1);
 
         public event EventHandler<double>? ProgressChanged;
@@ -105,6 +105,8 @@ namespace DecryptStation3.Services
                         plain = !plain;
                         ProgressChanged?.Invoke(this, (double)(i + 1) / regions);
                     }
+
+                    outFile.Flush();
                 }, cancellationToken);
             }
             catch (Exception ex)
