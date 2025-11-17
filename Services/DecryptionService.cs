@@ -1,151 +1,99 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using DecryptStation3.Models;
-using System.Diagnostics;
 
 namespace DecryptStation3.Services
 {
     public class DecryptionService
     {
-        private const int BufferSizeSec = 4096;
-        private const int BufferSize = BufferSizeSec * 2048;
-        private uint _globalLBA = 0;
+        private const int SectorSize = 2048;
+        private const int BufferSizeSec = 4096;              // sectors per chunk
+        private const int BufferSize = BufferSizeSec * SectorSize;
+
         private readonly int _threadCount = Math.Max(1, Environment.ProcessorCount - 1);
 
         public event EventHandler<double>? ProgressChanged;
+
+        private sealed class Region
+        {
+            public ulong Start;
+            public ulong End;
+        }
 
         public async Task DecryptFileAsync(IsoFile isoFile, string hexKey, CancellationToken cancellationToken = default)
         {
             try
             {
-                _globalLBA = 0;
+                var key = ParseKey(hexKey);
 
-                var key = new byte[16];
-                var potKey = hexKey;
-                if (potKey.Length == 34)
-                    potKey = potKey.Substring(2);
-                if (potKey.Length != 32)
-                    throw new Exception("ERROR: Key must be 32 hex characters in length");
+                await using var inFile = new FileStream(
+                    isoFile.FilePath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read);
 
-                potKey = potKey.ToUpper();
-                for (int i = 0; i < potKey.Length; i += 2)
-                {
-                    key[i / 2] = Convert.ToByte(potKey.Substring(i, 2), 16);
-                }
+                await using var outFile = new FileStream(
+                    isoFile.FilePath + ".dec",
+                    FileMode.Create,
+                    FileAccess.ReadWrite,
+                    FileShare.None);
 
-                await using var inFile = new FileStream(isoFile.FilePath, FileMode.Open, FileAccess.Read);
-                await using var outFile = new FileStream(isoFile.FilePath + ".dec", FileMode.Create);
+                long fileSize = inFile.Length;
+                if (fileSize % SectorSize != 0)
+                    throw new Exception($"ERROR: File size {fileSize} is not a multiple of sector size ({SectorSize}).");
 
-                var fileSize = inFile.Length;
-                var totalSectors = fileSize / 2048;
+                long totalSectors = fileSize / SectorSize;
+
                 Debug.WriteLine($"[DECRYPT] File: {Path.GetFileName(isoFile.FilePath)}");
                 Debug.WriteLine($"[DECRYPT] File size: {fileSize:N0} bytes ({totalSectors} sectors)");
 
-                var sec0sec1 = new byte[4096];
-                ReadFully(inFile, sec0sec1, 0, 4096);
+                // --- Read header once to build the regions (like Rust's extract_regions) ---
+                var header = new byte[4096];
+                ReadFully(inFile, header, 0, header.Length);
 
-                var numNormalRegions = CharArrBEToUInt(sec0sec1);
-                var regions = (numNormalRegions * 2) - 1;
-                Debug.WriteLine($"[DECRYPT] Normal regions: {numNormalRegions}, Total regions: {regions}");
+                var regions = ExtractRegions(header);
+                Debug.WriteLine($"[DECRYPT] Regions (from header): {regions.Count}");
 
-                var inBuffer = new byte[BufferSize];
+                // For actual processing, start again from the beginning,
+                // just like Rust opens a second handle at offset 0.
+                inFile.Seek(0, SeekOrigin.Begin);
+                outFile.SetLength(fileSize);
 
                 await Task.Run(() =>
                 {
-                    var first = true;
-                    var plain = true;
-                    uint totalSectorsProcessed = 0;
+                    var buffer = new byte[BufferSize];
+                    long currentSector = 0;
 
-                    for (uint i = 0; i < regions; i++)
+                    while (currentSector < totalSectors)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
-                        // Read region start and end sectors
-                        // Each region entry is 8 bytes (4 bytes start + 4 bytes end)
-                        // Both are EXCLUSIVE boundaries (Rust uses sector >= start && sector < end)
-                        var regionStartSector = CharArrBEToUInt(sec0sec1, 4 + ((int)i * 8));
-                        var regionEndSector = CharArrBEToUInt(sec0sec1, 8 + ((int)i * 8));
+                        int sectorsThisChunk = (int)Math.Min((long)BufferSizeSec, totalSectors - currentSector);
+                        int bytesToRead = sectorsThisChunk * SectorSize;
 
-                        // Calculate sector count: end - start (both exclusive)
-                        uint numSectors = regionEndSector - regionStartSector;
+                        ReadFully(inFile, buffer, 0, bytesToRead);
 
-                        // Update _globalLBA to this region's start
-                        _globalLBA = regionStartSector;
-                        uint numFullBlocks = numSectors / BufferSizeSec;
-                        uint partialBlockSize = numSectors % BufferSizeSec;
-                        uint numBlocks = numFullBlocks + (partialBlockSize == 0 ? 0u : 1u);
+                        ProcessChunk(buffer, sectorsThisChunk, key, regions, currentSector);
 
-                        Debug.WriteLine($"[DECRYPT] Region {i}: {(plain ? "PLAIN" : "ENCRYPTED")}, " +
-                            $"Start={regionStartSector}, End={regionEndSector}, Sectors={numSectors}, " +
-                            $"Blocks={numBlocks} (full={numFullBlocks}, partial={partialBlockSize})");
+                        outFile.Write(buffer, 0, bytesToRead);
 
-                        if (plain)
-                        {
-                            for (uint currBlock = 0; currBlock < numBlocks; currBlock++)
-                            {
-                                uint currBlockSize = (currBlock == numFullBlocks) ? partialBlockSize : BufferSizeSec;
-                                int bytesToRead = (int)(currBlockSize * 2048);
-
-                                if (first)
-                                {
-                                    if (currBlock == 0)
-                                    {
-                                        // Header (first 4096 bytes / 2 sectors) was already read
-                                        int headerSize = Math.Min(4096, bytesToRead);
-                                        Array.Copy(sec0sec1, 0, inBuffer, 0, headerSize);
-
-                                        int remainingBytes = bytesToRead - headerSize;
-                                        if (remainingBytes > 0)
-                                        {
-                                            ReadFully(inFile, inBuffer, headerSize, remainingBytes);
-                                        }
-                                        Debug.WriteLine($"[DECRYPT] First block: copied {headerSize} bytes from header, read {remainingBytes} bytes from file");
-                                    }
-                                    else
-                                    {
-                                        ReadFully(inFile, inBuffer, 0, bytesToRead);
-                                    }
-                                    first = false;
-                                }
-                                else
-                                {
-                                    ReadFully(inFile, inBuffer, 0, bytesToRead);
-                                }
-
-                                outFile.Write(inBuffer, 0, bytesToRead);
-                                _globalLBA += currBlockSize;
-                            }
-                        }
-                        else
-                        {
-                            for (uint currBlock = 0; currBlock < numBlocks; currBlock++)
-                            {
-                                uint currBlockSize = (currBlock == numFullBlocks) ? partialBlockSize : BufferSizeSec;
-                                int bytesToRead = (int)(currBlockSize * 2048);
-                                ReadFully(inFile, inBuffer, 0, bytesToRead);
-                                ProcessData(inBuffer, (int)currBlockSize, key);
-                                outFile.Write(inBuffer, 0, bytesToRead);
-                            }
-                        }
-
-                        totalSectorsProcessed += numSectors;
-                        Debug.WriteLine($"[DECRYPT] Region {i} complete. Total sectors processed: {totalSectorsProcessed}, LBA now: {_globalLBA}");
-
-                        plain = !plain;
-                        ProgressChanged?.Invoke(this, (double)(i + 1) / regions);
-                    }
-
-                    Debug.WriteLine($"[DECRYPT] All regions processed. Total sectors: {totalSectorsProcessed}, Expected: {totalSectors}");
-                    if (totalSectorsProcessed != totalSectors)
-                    {
-                        Debug.WriteLine($"[DECRYPT] WARNING: Sector count mismatch! Processed {totalSectorsProcessed} but file has {totalSectors} sectors");
+                        currentSector += sectorsThisChunk;
+                        ProgressChanged?.Invoke(this, (double)currentSector / totalSectors);
                     }
 
                     outFile.Flush();
+                    Debug.WriteLine("[DECRYPT] Decryption finished.");
                 }, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                Debug.WriteLine("[DECRYPT] Decryption cancelled.");
+                throw;
             }
             catch (Exception ex)
             {
@@ -155,14 +103,85 @@ namespace DecryptStation3.Services
             }
         }
 
-        private void ProcessData(byte[] data, int sectorCount, byte[] key)
-        {
-            const int sectorSize = 2048;
+        // --- Core logic mirrored from Rust ---
 
-            Parallel.For(0, sectorCount, new ParallelOptions { MaxDegreeOfParallelism = _threadCount }, k =>
+        private static byte[] ParseKey(string hexKey)
+        {
+            var potKey = hexKey.Trim();
+
+            // Allow optional "0x" prefix (32 hex chars or "0x" + 32).
+            if (potKey.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                potKey = potKey.Substring(2);
+
+            if (potKey.Length != 32)
+                throw new Exception("ERROR: Key must be 32 hex characters in length");
+
+            var key = new byte[16];
+            for (int i = 0; i < potKey.Length; i += 2)
             {
+                key[i / 2] = Convert.ToByte(potKey.Substring(i, 2), 16);
+            }
+
+            return key;
+        }
+
+        /// <summary>
+        /// Equivalent to Rust's extract_regions(): reads num_normal_regions and builds
+        /// (num_normal_regions * 2) - 1 regions from the 4096-byte header.
+        /// </summary>
+        private static List<Region> ExtractRegions(byte[] header)
+        {
+            uint numNormalRegions = CharArrBEToUInt(header, 0);
+            int regionsCount = (int)(numNormalRegions * 2 - 1);
+
+            var regions = new List<Region>(regionsCount);
+
+            for (int i = 0; i < regionsCount; i++)
+            {
+                int regionOffset = 4 + (i * 8);
+
+                uint start = CharArrBEToUInt(header, regionOffset);
+                uint end = CharArrBEToUInt(header, regionOffset + 4);
+
+                regions.Add(new Region
+                {
+                    Start = start,
+                    End = end
+                });
+            }
+
+            return regions;
+        }
+
+        /// <summary>
+        /// Processes a buffer containing 'sectorCount' sectors starting at 'baseSector'.
+        /// For each sector, mirrors Rust's:
+        ///   if is_encrypted(regions, sector_index, sector_data) { decrypt_sector(...) }
+        /// </summary>
+        private void ProcessChunk(
+            byte[] data,
+            int sectorCount,
+            byte[] key,
+            List<Region> regions,
+            long baseSector)
+        {
+            var options = new ParallelOptions
+            {
+                MaxDegreeOfParallelism = _threadCount
+            };
+
+            Parallel.For(0, sectorCount, options, k =>
+            {
+                long sectorIndex = baseSector + k;
+                int offset = k * SectorSize;
+
+                if (!IsSectorEncrypted(regions, sectorIndex, data, offset))
+                    return;
+
+                // AES-128 CBC, IV derived from sector index (last 4 bytes big-endian),
+                // exactly like Rust's generate_iv + manual CBC.
                 var iv = new byte[16];
-                ResetIV(iv, _globalLBA + (uint)k);
+                ResetIV(iv, (uint)sectorIndex);
 
                 using var aes = Aes.Create();
                 aes.Key = key;
@@ -171,16 +190,52 @@ namespace DecryptStation3.Services
                 aes.Padding = PaddingMode.None;
 
                 using var transform = aes.CreateDecryptor();
-                int offset = k * sectorSize;
-                transform.TransformBlock(data, offset, sectorSize, data, offset);
+                transform.TransformBlock(data, offset, SectorSize, data, offset);
             });
-
-            _globalLBA += (uint)sectorCount;
         }
 
+        /// <summary>
+        /// Mirrors Rust's is_encrypted():
+        ///   - If sector is all zeros -> not encrypted
+        ///   - If sectorIndex is inside any Region [start, end) -> encrypted
+        /// </summary>
+        private static bool IsSectorEncrypted(
+            List<Region> regions,
+            long sectorIndex,
+            byte[] data,
+            int offset)
+        {
+            // 1) Skip all-zero sectors (fast path).
+            bool allZero = true;
+            int end = offset + SectorSize;
+            for (int i = offset; i < end; i++)
+            {
+                if (data[i] != 0)
+                {
+                    allZero = false;
+                    break;
+                }
+            }
+
+            if (allZero)
+                return false;
+
+            // 2) Check if the sector lies inside any [start, end) region
+            foreach (var region in regions)
+            {
+                if (sectorIndex >= (long)region.Start && sectorIndex < (long)region.End)
+                    return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Equivalent to Rust's generate_iv(sector): only last 4 bytes hold the sector index (big-endian).
+        /// </summary>
         private static void ResetIV(byte[] iv, uint sectorNumber)
         {
-            Array.Clear(iv, 0, 12);
+            Array.Clear(iv, 0, iv.Length);
             iv[12] = (byte)((sectorNumber & 0xFF000000) >> 24);
             iv[13] = (byte)((sectorNumber & 0x00FF0000) >> 16);
             iv[14] = (byte)((sectorNumber & 0x0000FF00) >> 8);
@@ -189,33 +244,34 @@ namespace DecryptStation3.Services
 
         private static uint CharArrBEToUInt(byte[] arr, int offset = 0)
         {
-            return (uint)(arr[offset + 3] + (arr[offset + 2] << 8) +
-                         (arr[offset + 1] << 16) + (arr[offset] << 24));
+            return (uint)(arr[offset + 3]
+                        + (arr[offset + 2] << 8)
+                        + (arr[offset + 1] << 16)
+                        + (arr[offset] << 24));
         }
 
         private static void ReadFully(Stream stream, byte[] buffer, int offset, int count)
         {
-            if (count == 0) return; // Nothing to read
+            if (count == 0) return;
 
             if (count < 0)
-            {
                 throw new IOException($"Invalid read count: {count} bytes (offset={offset})");
-            }
 
-            var totalRead = 0;
+            int totalRead = 0;
             while (totalRead < count)
             {
-                var read = stream.Read(buffer, offset + totalRead, count - totalRead);
+                int read = stream.Read(buffer, offset + totalRead, count - totalRead);
                 if (read <= 0)
                 {
-                    var pos = stream.Position;
-                    var len = stream.Length;
+                    long pos = stream.Position;
+                    long len = stream.Length;
                     throw new IOException(
                         $"Failed to read from file: requested {count} bytes at offset {offset}, " +
                         $"but only read {totalRead}/{count} bytes. " +
                         $"Stream position: {pos}, Stream length: {len}, " +
                         $"Trying to read {count - totalRead} more bytes");
                 }
+
                 totalRead += read;
             }
         }
