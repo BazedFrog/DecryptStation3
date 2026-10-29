@@ -187,9 +187,8 @@ namespace DecryptStation3.Services
         }
 
         /// <summary>
-        /// Processes a buffer containing 'sectorCount' sectors starting at 'baseSector'.
-        /// For each sector, mirrors Rust's:
-        ///   if is_encrypted(regions, sector_index, sector_data) { decrypt_sector(...) }
+        /// Processes a buffer containing 'sectorCount' sectors starting at 'baseSector',
+        /// decrypting every sector that lies inside an encrypted region.
         /// </summary>
         private void ProcessChunk(
             byte[] data,
@@ -208,7 +207,7 @@ namespace DecryptStation3.Services
                 long sectorIndex = baseSector + k;
                 int offset = k * SectorSize;
 
-                if (!IsSectorEncrypted(regions, sectorIndex, data, offset))
+                if (!IsSectorEncrypted(regions, sectorIndex))
                     return;
 
                 // AES-128 CBC, IV derived from sector index (last 4 bytes big-endian),
@@ -228,32 +227,13 @@ namespace DecryptStation3.Services
         }
 
         /// <summary>
-        /// Mirrors Rust's is_encrypted():
-        ///   - If sector is all zeros -> not encrypted
-        ///   - If sectorIndex is inside any Region [start, end) -> encrypted
+        /// A sector is encrypted when it lies inside any Region [start, end).
+        /// Like PS3Dec (and the console itself), every sector in an encrypted region is
+        /// decrypted, including all-zero ones, so the output is byte-identical to PS3Dec
+        /// and re-encrypting it reproduces the original image exactly.
         /// </summary>
-        private static bool IsSectorEncrypted(
-            List<Region> regions,
-            long sectorIndex,
-            byte[] data,
-            int offset)
+        private static bool IsSectorEncrypted(List<Region> regions, long sectorIndex)
         {
-            // 1) Skip all-zero sectors (fast path).
-            bool allZero = true;
-            int end = offset + SectorSize;
-            for (int i = offset; i < end; i++)
-            {
-                if (data[i] != 0)
-                {
-                    allZero = false;
-                    break;
-                }
-            }
-
-            if (allZero)
-                return false;
-
-            // 2) Check if the sector lies inside any [start, end) region
             foreach (var region in regions)
             {
                 if (sectorIndex >= (long)region.Start && sectorIndex < (long)region.End)
