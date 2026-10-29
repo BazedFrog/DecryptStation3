@@ -27,80 +27,98 @@ namespace DecryptStation3.Services
 
         public async Task DecryptFileAsync(IsoFile isoFile, string hexKey, CancellationToken cancellationToken = default)
         {
+            var outputPath = isoFile.FilePath + ".dec";
+
+            // Decrypt into a temporary file and only move it into place once every sector
+            // has been written. The output is pre-sized to the full image, so a failed or
+            // interrupted run would otherwise leave a .dec that looks complete but isn't.
+            var tempPath = outputPath + ".part";
+
             try
             {
                 var key = ParseKey(hexKey);
 
-                await using var inFile = new FileStream(
-                    isoFile.FilePath,
-                    FileMode.Open,
-                    FileAccess.Read,
-                    FileShare.Read);
+                await DecryptToFileAsync(isoFile.FilePath, tempPath, key, cancellationToken);
 
-                await using var outFile = new FileStream(
-                    isoFile.FilePath + ".dec",
-                    FileMode.Create,
-                    FileAccess.ReadWrite,
-                    FileShare.None);
-
-                long fileSize = inFile.Length;
-                if (fileSize % SectorSize != 0)
-                    throw new Exception($"ERROR: File size {fileSize} is not a multiple of sector size ({SectorSize}).");
-
-                long totalSectors = fileSize / SectorSize;
-
-                Debug.WriteLine($"[DECRYPT] File: {Path.GetFileName(isoFile.FilePath)}");
-                Debug.WriteLine($"[DECRYPT] File size: {fileSize:N0} bytes ({totalSectors} sectors)");
-
-                // --- Read header once to build the regions (like Rust's extract_regions) ---
-                var header = new byte[4096];
-                ReadFully(inFile, header, 0, header.Length);
-
-                var regions = ExtractRegions(header);
-                Debug.WriteLine($"[DECRYPT] Regions (from header): {regions.Count}");
-
-                // For actual processing, start again from the beginning,
-                // just like Rust opens a second handle at offset 0.
-                inFile.Seek(0, SeekOrigin.Begin);
-                outFile.SetLength(fileSize);
-
-                await Task.Run(() =>
-                {
-                    var buffer = new byte[BufferSize];
-                    long currentSector = 0;
-
-                    while (currentSector < totalSectors)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-
-                        int sectorsThisChunk = (int)Math.Min((long)BufferSizeSec, totalSectors - currentSector);
-                        int bytesToRead = sectorsThisChunk * SectorSize;
-
-                        ReadFully(inFile, buffer, 0, bytesToRead);
-
-                        ProcessChunk(buffer, sectorsThisChunk, key, regions, currentSector);
-
-                        outFile.Write(buffer, 0, bytesToRead);
-
-                        currentSector += sectorsThisChunk;
-                        ProgressChanged?.Invoke(this, (double)currentSector / totalSectors);
-                    }
-
-                    outFile.Flush();
-                    Debug.WriteLine("[DECRYPT] Decryption finished.");
-                }, cancellationToken);
+                File.Move(tempPath, outputPath, overwrite: true);
+                Debug.WriteLine("[DECRYPT] Decryption finished.");
             }
             catch (OperationCanceledException)
             {
+                TryDeleteFile(tempPath);
                 Debug.WriteLine("[DECRYPT] Decryption cancelled.");
                 throw;
             }
             catch (Exception ex)
             {
+                TryDeleteFile(tempPath);
                 Debug.WriteLine($"[DECRYPT] ERROR: {ex.Message}");
                 Debug.WriteLine($"[DECRYPT] Stack trace: {ex.StackTrace}");
                 throw new Exception($"Decryption failed: {ex.Message}", ex);
             }
+        }
+
+        private async Task DecryptToFileAsync(string inputPath, string outputPath, byte[] key, CancellationToken cancellationToken)
+        {
+            await using var inFile = new FileStream(
+                inputPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read);
+
+            await using var outFile = new FileStream(
+                outputPath,
+                FileMode.Create,
+                FileAccess.ReadWrite,
+                FileShare.None);
+
+            long fileSize = inFile.Length;
+            if (fileSize % SectorSize != 0)
+                throw new Exception($"ERROR: File size {fileSize} is not a multiple of sector size ({SectorSize}).");
+
+            long totalSectors = fileSize / SectorSize;
+
+            Debug.WriteLine($"[DECRYPT] File: {Path.GetFileName(inputPath)}");
+            Debug.WriteLine($"[DECRYPT] File size: {fileSize:N0} bytes ({totalSectors} sectors)");
+
+            // --- Sector 0 holds the region table ---
+            var header = new byte[SectorSize];
+            ReadFully(inFile, header, 0, header.Length);
+
+            var regions = ExtractRegions(header);
+            Debug.WriteLine($"[DECRYPT] Encrypted regions: {regions.Count}");
+            foreach (var region in regions)
+                Debug.WriteLine($"[DECRYPT]   sectors {region.Start}-{region.End - 1}");
+
+            // For actual processing, start again from the beginning,
+            // just like Rust opens a second handle at offset 0.
+            inFile.Seek(0, SeekOrigin.Begin);
+            outFile.SetLength(fileSize);
+
+            await Task.Run(() =>
+            {
+                var buffer = new byte[BufferSize];
+                long currentSector = 0;
+
+                while (currentSector < totalSectors)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    int sectorsThisChunk = (int)Math.Min((long)BufferSizeSec, totalSectors - currentSector);
+                    int bytesToRead = sectorsThisChunk * SectorSize;
+
+                    ReadFully(inFile, buffer, 0, bytesToRead);
+
+                    ProcessChunk(buffer, sectorsThisChunk, key, regions, currentSector);
+
+                    outFile.Write(buffer, 0, bytesToRead);
+
+                    currentSector += sectorsThisChunk;
+                    ProgressChanged?.Invoke(this, (double)currentSector / totalSectors);
+                }
+
+                outFile.Flush();
+            }, cancellationToken);
         }
 
         // --- Core logic mirrored from Rust ---
@@ -126,28 +144,43 @@ namespace DecryptStation3.Services
         }
 
         /// <summary>
-        /// Equivalent to Rust's extract_regions(): reads num_normal_regions and builds
-        /// (num_normal_regions * 2) - 1 regions from the 4096-byte header.
+        /// Reads the region table from sector 0 and returns the encrypted regions as
+        /// [Start, End) sector ranges. The table (big-endian u32 values) is:
+        ///   0x00  number of unencrypted regions (n)
+        ///   0x04  unused (0)
+        ///   0x08  n pairs of (first sector, last sector) of each unencrypted region
+        /// The last sector is inclusive, so the encrypted regions are the gaps
+        /// between consecutive unencrypted regions.
         /// </summary>
         private static List<Region> ExtractRegions(byte[] header)
         {
-            uint numNormalRegions = CharArrBEToUInt(header, 0);
-            int regionsCount = (int)(numNormalRegions * 2 - 1);
+            uint numPlainRegions = CharArrBEToUInt(header, 0);
+            if (numPlainRegions == 0 || numPlainRegions > (SectorSize - 8) / 8)
+                throw new Exception($"ERROR: Invalid region table ({numPlainRegions} unencrypted regions).");
 
-            var regions = new List<Region>(regionsCount);
+            var regions = new List<Region>((int)numPlainRegions - 1);
+            ulong previousEnd = 0;
 
-            for (int i = 0; i < regionsCount; i++)
+            for (int i = 0; i < numPlainRegions; i++)
             {
-                int regionOffset = 4 + (i * 8);
+                int regionOffset = 8 + (i * 8);
 
-                uint start = CharArrBEToUInt(header, regionOffset);
-                uint end = CharArrBEToUInt(header, regionOffset + 4);
+                ulong start = CharArrBEToUInt(header, regionOffset);
+                ulong end = (ulong)CharArrBEToUInt(header, regionOffset + 4) + 1;
 
-                regions.Add(new Region
+                if (start >= end || (i > 0 && start < previousEnd))
+                    throw new Exception("ERROR: Invalid region table (regions are reversed or overlapping).");
+
+                if (i > 0 && start > previousEnd)
                 {
-                    Start = start,
-                    End = end
-                });
+                    regions.Add(new Region
+                    {
+                        Start = previousEnd,
+                        End = start
+                    });
+                }
+
+                previousEnd = end;
             }
 
             return regions;
@@ -248,6 +281,18 @@ namespace DecryptStation3.Services
                         + (arr[offset + 2] << 8)
                         + (arr[offset + 1] << 16)
                         + (arr[offset] << 24));
+        }
+
+        private static void TryDeleteFile(string path)
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[DECRYPT] Could not delete {path}: {ex.Message}");
+            }
         }
 
         private static void ReadFully(Stream stream, byte[] buffer, int offset, int count)
