@@ -1,0 +1,67 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 1.0.1 (leave empty to only build)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish
+        run: dotnet publish DecryptStation3.csproj -c Release -r win-x64 --self-contained true -o publish
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DecryptStation3-win-x64
+          path: publish/
+          if-no-files-found: error
+
+  release:
+    # Manual "Run workflow" on master with a version creates the tag and the GitHub release.
+    if: github.event_name == 'workflow_dispatch' && inputs.version != '' && github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check version
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version must look like 1.2.3, got '$VERSION'" >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: DecryptStation3-win-x64
+          path: publish
+
+      - name: Create release
+        run: |
+          zip_name="DecryptStation3-v${VERSION}-win-x64.zip"
+          (cd publish && zip -qr "../${zip_name}" .)
+          gh release create "DecryptStation3v${VERSION}" "${zip_name}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "DecryptStation3 v${VERSION}" \
+            --generate-notes
